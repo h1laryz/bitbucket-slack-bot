@@ -1,0 +1,11 @@
+# Put local stuff here
+
+.PHONY: docker-run-postgresql
+docker-run-postgresql:
+	docker run -d --rm \
+		--name git-slack-bot-postgres \
+		-p 5432:5432 \
+		-e POSTGRES_USER=${POSTGRES_USER} \
+		-e POSTGRES_PASSWORD=${POSTGRES_PASSWORD} \
+		-e POSTGRES_DB=${POSTGRES_DB} \
+		postgres:17-alpine

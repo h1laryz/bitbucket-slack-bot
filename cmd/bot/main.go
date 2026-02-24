@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"bitbucket-slack-bot/internal/bitbucket"
-	"bitbucket-slack-bot/internal/config"
-	slackbot "bitbucket-slack-bot/internal/slack"
+	botapi "git-slack-bot/internal/api"
+	"git-slack-bot/internal/config"
+	"git-slack-bot/internal/db"
+	slackbot "git-slack-bot/internal/slack"
+	"git-slack-bot/internal/store"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -24,25 +27,36 @@ func main() {
 
 	cfg, err := config.Load()
 	if err != nil {
-		log.Error("config load failed", "err", err)
+		log.Error("config error", "err", err)
 		os.Exit(1)
 	}
 
-	// Clients
+	log.Info("starting", "git-provider", cfg.GitProvider, "addr", cfg.ServerAddr)
+
+	// PostgreSQL connection pool.
+	pool, err := db.Connect(context.Background(), cfg.DatabaseURL)
+	if err != nil {
+		log.Error("db connect error", "err", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+	log.Info("db connected", "max_conns", pool.Config().MaxConns)
+
+	// Per-team git credential store.
+	teamStore := store.New()
+
+	// Slack client (one per bot instance).
 	slackClient := slacklib.New(cfg.SlackBotToken)
-	bbClient := bitbucket.NewClient(
-		cfg.BitbucketBaseURL,
-		cfg.BitbucketWorkspace,
-		cfg.BitbucketUsername,
-		cfg.BitbucketToken,
-	)
 
-	// Slack handler
-	handler := slackbot.NewHandler(slackClient, bbClient, log)
+	// Slack webhook handler — uses teamStore to look up credentials per request.
+	slackHandler := slackbot.NewHandler(slackClient, teamStore, cfg.GitProvider, log)
 
-	// Fiber app
+	// Management API handler — lets admins register team credentials.
+	apiHandler := botapi.NewHandler(teamStore)
+
+	// Fiber app.
 	app := fiber.New(fiber.Config{
-		AppName:      "bitbucket-slack-bot",
+		AppName:      "git-slack-bot",
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	})
@@ -53,17 +67,18 @@ func main() {
 	}))
 
 	app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"status": "ok"})
+		return c.JSON(fiber.Map{"status": "ok", "git_provider": cfg.GitProvider})
 	})
 
-	slackbot.RegisterRoutes(app, handler, cfg.SlackSignSecret)
+	slackbot.RegisterRoutes(app, slackHandler, cfg.SlackSignSecret)
+	botapi.RegisterRoutes(app, apiHandler, cfg.APIKey)
 
-	// Graceful shutdown
+	// Graceful shutdown.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Info("server starting", "addr", cfg.ServerAddr)
+		log.Info("server listening", "addr", cfg.ServerAddr)
 		if err := app.Listen(cfg.ServerAddr); err != nil {
 			log.Error("server error", "err", err)
 		}

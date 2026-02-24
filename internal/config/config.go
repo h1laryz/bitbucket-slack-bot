@@ -1,68 +1,79 @@
 package config
 
 import (
+	"flag"
 	"fmt"
-	"os"
+	"strings"
 
-	"github.com/joho/godotenv"
+	"git-slack-bot/internal/provider"
 )
 
+// Config holds all runtime configuration sourced from CLI flags.
+// Git provider credentials are NOT here — they are set per Slack team
+// via POST /api/teams/{team_id}/config.
 type Config struct {
-	// Server
+	// ServerAddr is the address the HTTP server listens on (e.g. ":3000").
 	ServerAddr string
 
-	// Slack
+	// Slack application credentials.
 	SlackBotToken   string
 	SlackSignSecret string
 
-	// Bitbucket
-	BitbucketBaseURL   string
-	BitbucketUsername  string
-	BitbucketToken     string
-	BitbucketWorkspace string
+	// GitProvider is the git hosting backend to use (bitbucket, github).
+	GitProvider provider.Type
+
+	// APIKey protects the /api/teams/* management endpoints.
+	APIKey string
+
+	// DatabaseURL is the PostgreSQL connection string.
+	DatabaseURL string
 }
 
 func Load() (*Config, error) {
-	_ = godotenv.Load()
+	cfg := &Config{}
+	var gitProvider string
 
-	cfg := &Config{
-		ServerAddr:         getEnvOrDefault("SERVER_ADDR", ":3000"),
-		SlackBotToken:      os.Getenv("SLACK_BOT_TOKEN"),
-		SlackSignSecret:    os.Getenv("SLACK_SIGNING_SECRET"),
-		BitbucketBaseURL:   getEnvOrDefault("BITBUCKET_BASE_URL", "https://api.bitbucket.org/2.0"),
-		BitbucketUsername:  os.Getenv("BITBUCKET_USERNAME"),
-		BitbucketToken:     os.Getenv("BITBUCKET_TOKEN"),
-		BitbucketWorkspace: os.Getenv("BITBUCKET_WORKSPACE"),
-	}
+	flag.StringVar(&cfg.ServerAddr, "addr", ":3000", "address the server listens on")
+	flag.StringVar(&cfg.SlackBotToken, "slack-bot-token", "", "Slack bot token (xoxb-…)")
+	flag.StringVar(&cfg.SlackSignSecret, "slack-signing-secret", "", "Slack signing secret")
+	flag.StringVar(&gitProvider, "git-provider", "", "git hosting provider: bitbucket, github")
+	flag.StringVar(&cfg.APIKey, "api-key", "", "bearer token protecting the /api/teams/* endpoints")
+	flag.StringVar(&cfg.DatabaseURL, "db-url", "", "PostgreSQL connection URL (postgres://user:pass@host/db)")
+	flag.Parse()
 
-	if err := cfg.validate(); err != nil {
+	if err := cfg.validate(gitProvider); err != nil {
 		return nil, err
 	}
 
 	return cfg, nil
 }
 
-func (c *Config) validate() error {
-	required := map[string]string{
-		"SLACK_BOT_TOKEN":      c.SlackBotToken,
-		"SLACK_SIGNING_SECRET": c.SlackSignSecret,
-		"BITBUCKET_USERNAME":   c.BitbucketUsername,
-		"BITBUCKET_TOKEN":      c.BitbucketToken,
-		"BITBUCKET_WORKSPACE":  c.BitbucketWorkspace,
+func (c *Config) validate(gitProvider string) error {
+	var missing []string
+
+	if c.SlackBotToken == "" {
+		missing = append(missing, "--slack-bot-token")
+	}
+	if c.SlackSignSecret == "" {
+		missing = append(missing, "--slack-signing-secret")
+	}
+	if c.APIKey == "" {
+		missing = append(missing, "--api-key")
 	}
 
-	for key, val := range required {
-		if val == "" {
-			return fmt.Errorf("missing required env var: %s", key)
-		}
+	if c.DatabaseURL == "" {
+		missing = append(missing, "--db-url")
 	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required flags: %s", strings.Join(missing, ", "))
+	}
+
+	pt, err := provider.ParseType(gitProvider)
+	if err != nil {
+		return fmt.Errorf("--git-provider: %w", err)
+	}
+	c.GitProvider = pt
 
 	return nil
-}
-
-func getEnvOrDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }

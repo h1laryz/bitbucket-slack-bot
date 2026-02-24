@@ -5,7 +5,8 @@ import (
 	"log/slog"
 	"strings"
 
-	"bitbucket-slack-bot/internal/bitbucket"
+	"git-slack-bot/internal/provider"
+	"git-slack-bot/internal/store"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -13,22 +14,34 @@ import (
 
 // Handler processes Slack events and slash commands.
 type Handler struct {
-	client *slack.Client
-	bb     *bitbucket.Client
-	log    *slog.Logger
+	client       *slack.Client
+	store        *store.TeamStore
+	providerType provider.Type
+	log          *slog.Logger
 }
 
-func NewHandler(client *slack.Client, bb *bitbucket.Client, log *slog.Logger) *Handler {
+func NewHandler(client *slack.Client, store *store.TeamStore, providerType provider.Type, log *slog.Logger) *Handler {
 	return &Handler{
-		client: client,
-		bb:     bb,
-		log:    log,
+		client:       client,
+		store:        store,
+		providerType: providerType,
+		log:          log,
 	}
+}
+
+// gitFor returns a configured git provider for the Slack team that issued the command.
+// Returns a user-friendly error if the team has not set credentials yet.
+func (h *Handler) gitFor(teamID string) (provider.Provider, error) {
+	cfg, err := h.store.Get(teamID)
+	if err != nil {
+		return nil, err
+	}
+	return provider.New(h.providerType, cfg)
 }
 
 // HandleSlashCommand routes slash commands to the appropriate handler.
 func (h *Handler) HandleSlashCommand(cmd slack.SlashCommand) {
-	h.log.Info("slash command", "command", cmd.Command, "text", cmd.Text, "user", cmd.UserName)
+	h.log.Info("slash command", "command", cmd.Command, "text", cmd.Text, "user", cmd.UserName, "team", cmd.TeamID)
 
 	switch cmd.Command {
 	case "/bb-prs":
@@ -42,8 +55,7 @@ func (h *Handler) HandleSlashCommand(cmd slack.SlashCommand) {
 
 // HandleEvent routes Events API callbacks.
 func (h *Handler) HandleEvent(event slackevents.EventsAPIEvent) error {
-	switch event.Type {
-	case slackevents.CallbackEvent:
+	if event.Type == slackevents.CallbackEvent {
 		h.handleCallbackEvent(event)
 	}
 	return nil
@@ -64,9 +76,15 @@ func (h *Handler) handlePRsCommand(cmd slack.SlashCommand) {
 		return
 	}
 
-	prs, err := h.bb.ListOpenPRs(repo)
+	git, err := h.gitFor(cmd.TeamID)
 	if err != nil {
-		h.log.Error("list PRs failed", "repo", repo, "err", err)
+		h.respond(cmd.ChannelID, fmt.Sprintf(":x: %v", err))
+		return
+	}
+
+	prs, err := git.ListOpenPRs(repo)
+	if err != nil {
+		h.log.Error("list PRs failed", "repo", repo, "team", cmd.TeamID, "err", err)
 		h.respond(cmd.ChannelID, fmt.Sprintf("Failed to fetch PRs for `%s`: %v", repo, err))
 		return
 	}
@@ -83,15 +101,14 @@ func (h *Handler) handlePRsCommand(cmd slack.SlashCommand) {
 
 	for _, pr := range prs {
 		text := fmt.Sprintf("*<%s|#%d: %s>*\n%s → %s | by %s",
-			pr.Links.HTML.Href, pr.ID, pr.Title,
-			pr.Source.Branch.Name, pr.Destination.Branch.Name,
-			pr.Author.DisplayName,
+			pr.URL, pr.ID, pr.Title,
+			pr.SourceBranch, pr.TargetBranch,
+			pr.Author,
 		)
-		blocks = append(blocks, slack.NewSectionBlock(
-			slack.NewTextBlockObject(slack.MarkdownType, text, false, false),
-			nil, nil,
-		))
-		blocks = append(blocks, slack.NewDividerBlock())
+		blocks = append(blocks,
+			slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil),
+			slack.NewDividerBlock(),
+		)
 	}
 
 	_, _, err = h.client.PostMessage(cmd.ChannelID, slack.MsgOptionBlocks(blocks...))
@@ -101,9 +118,15 @@ func (h *Handler) handlePRsCommand(cmd slack.SlashCommand) {
 }
 
 func (h *Handler) handleReposCommand(cmd slack.SlashCommand) {
-	repos, err := h.bb.ListRepos()
+	git, err := h.gitFor(cmd.TeamID)
 	if err != nil {
-		h.log.Error("list repos failed", "err", err)
+		h.respond(cmd.ChannelID, fmt.Sprintf(":x: %v", err))
+		return
+	}
+
+	repos, err := git.ListRepos()
+	if err != nil {
+		h.log.Error("list repos failed", "team", cmd.TeamID, "err", err)
 		h.respond(cmd.ChannelID, fmt.Sprintf("Failed to fetch repositories: %v", err))
 		return
 	}
@@ -116,7 +139,7 @@ func (h *Handler) handleReposCommand(cmd slack.SlashCommand) {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("*Repositories (%d)*\n", len(repos)))
 	for _, r := range repos {
-		sb.WriteString(fmt.Sprintf("• <%s|%s>", r.Links.HTML.Href, r.FullName))
+		sb.WriteString(fmt.Sprintf("• <%s|%s>", r.URL, r.FullName))
 		if r.Description != "" {
 			sb.WriteString(" — " + r.Description)
 		}
