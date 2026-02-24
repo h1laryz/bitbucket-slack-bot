@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -66,6 +67,30 @@ func (s *RepoStore) Migrate(ctx context.Context) error {
 			slack_user_id      TEXT PRIMARY KEY,
 			bitbucket_username TEXT NOT NULL UNIQUE,
 			created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE TABLE IF NOT EXISTS pr_commits (
+			repo_slug      TEXT    NOT NULL,
+			pr_id          INTEGER NOT NULL,
+			commit_hash    TEXT    NOT NULL,
+			pr_title       TEXT    NOT NULL,
+			pr_url         TEXT    NOT NULL,
+			author_name    TEXT    NOT NULL,
+			reviewer_names TEXT    NOT NULL DEFAULT '[]',
+			source_branch  TEXT    NOT NULL,
+			dest_branch    TEXT    NOT NULL,
+			PRIMARY KEY (repo_slug, pr_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_pr_commits_hash ON pr_commits (repo_slug, commit_hash);
+
+		CREATE TABLE IF NOT EXISTS build_statuses (
+			repo_slug   TEXT        NOT NULL,
+			commit_hash TEXT        NOT NULL,
+			state       TEXT        NOT NULL,
+			name        TEXT        NOT NULL,
+			url         TEXT        NOT NULL,
+			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (repo_slug, commit_hash)
 		);
 	`)
 	return err
@@ -330,4 +355,113 @@ func (s *RepoStore) GetSlackUserByBitbucket(ctx context.Context, bitbucketUserna
 		return "", err
 	}
 	return id, nil
+}
+
+// PRCommitRecord stores the PR info needed to rebuild Slack cards on pipeline status changes.
+type PRCommitRecord struct {
+	RepoSlug      string
+	PRID          int
+	CommitHash    string
+	Title         string
+	URL           string
+	AuthorName    string
+	ReviewerNames []string
+	SourceBranch  string
+	DestBranch    string
+}
+
+// SavePRCommit upserts the PR info and source commit hash.
+func (s *RepoStore) SavePRCommit(ctx context.Context, rec PRCommitRecord) error {
+	reviewersJSON, _ := json.Marshal(rec.ReviewerNames)
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO pr_commits (repo_slug, pr_id, commit_hash, pr_title, pr_url, author_name, reviewer_names, source_branch, dest_branch)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (repo_slug, pr_id) DO UPDATE SET
+			commit_hash    = EXCLUDED.commit_hash,
+			pr_title       = EXCLUDED.pr_title,
+			pr_url         = EXCLUDED.pr_url,
+			author_name    = EXCLUDED.author_name,
+			reviewer_names = EXCLUDED.reviewer_names,
+			source_branch  = EXCLUDED.source_branch,
+			dest_branch    = EXCLUDED.dest_branch
+	`, rec.RepoSlug, rec.PRID, rec.CommitHash, rec.Title, rec.URL,
+		rec.AuthorName, string(reviewersJSON), rec.SourceBranch, rec.DestBranch)
+	return err
+}
+
+// GetPRCommit retrieves the cached PR info. Returns nil if not found.
+func (s *RepoStore) GetPRCommit(ctx context.Context, repoSlug string, prID int) (*PRCommitRecord, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT repo_slug, pr_id, commit_hash, pr_title, pr_url, author_name, reviewer_names, source_branch, dest_branch
+		FROM pr_commits WHERE repo_slug = $1 AND pr_id = $2
+	`, repoSlug, prID)
+	var rec PRCommitRecord
+	var reviewersJSON string
+	if err := row.Scan(&rec.RepoSlug, &rec.PRID, &rec.CommitHash, &rec.Title, &rec.URL,
+		&rec.AuthorName, &reviewersJSON, &rec.SourceBranch, &rec.DestBranch); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	json.Unmarshal([]byte(reviewersJSON), &rec.ReviewerNames)
+	return &rec, nil
+}
+
+// GetPRsByCommit returns all PR IDs whose source commit matches the given hash.
+func (s *RepoStore) GetPRsByCommit(ctx context.Context, repoSlug, commitHash string) ([]int, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT pr_id FROM pr_commits WHERE repo_slug = $1 AND commit_hash = $2`,
+		repoSlug, commitHash,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// BuildStatus holds the latest pipeline/build status for a commit.
+type BuildStatus struct {
+	State string
+	Name  string
+	URL   string
+}
+
+// SaveBuildStatus upserts the latest build status for a commit.
+func (s *RepoStore) SaveBuildStatus(ctx context.Context, repoSlug, commitHash, state, name, buildURL string) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO build_statuses (repo_slug, commit_hash, state, name, url, updated_at)
+		VALUES ($1, $2, $3, $4, $5, NOW())
+		ON CONFLICT (repo_slug, commit_hash) DO UPDATE SET
+			state      = EXCLUDED.state,
+			name       = EXCLUDED.name,
+			url        = EXCLUDED.url,
+			updated_at = NOW()
+	`, repoSlug, commitHash, state, name, buildURL)
+	return err
+}
+
+// GetBuildStatus retrieves the latest build status for a commit. Returns nil if not found.
+func (s *RepoStore) GetBuildStatus(ctx context.Context, repoSlug, commitHash string) (*BuildStatus, error) {
+	row := s.pool.QueryRow(ctx,
+		`SELECT state, name, url FROM build_statuses WHERE repo_slug = $1 AND commit_hash = $2`,
+		repoSlug, commitHash,
+	)
+	var bs BuildStatus
+	if err := row.Scan(&bs.State, &bs.Name, &bs.URL); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &bs, nil
 }
