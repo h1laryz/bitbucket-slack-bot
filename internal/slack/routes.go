@@ -5,17 +5,19 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"git-slack-bot/internal/store"
+
 	"github.com/gofiber/fiber/v2"
 	slacklib "github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 )
 
 // RegisterRoutes mounts all Slack webhook routes under the given router group.
-func RegisterRoutes(router fiber.Router, h *Handler, signingSecret string) {
+func RegisterRoutes(router fiber.Router, h *Handler, signingSecret string, refreshFn func(*store.TokenRecord) (*store.TokenRecord, error)) {
 	verified := router.Group("/slack", VerifySignature(signingSecret))
 
 	verified.Post("/events", h.eventsRoute())
-	verified.Post("/commands", h.commandsRoute())
+	verified.Post("/commands", h.commandsRoute(refreshFn))
 }
 
 func (h *Handler) eventsRoute() fiber.Handler {
@@ -47,9 +49,8 @@ func (h *Handler) eventsRoute() fiber.Handler {
 	}
 }
 
-func (h *Handler) commandsRoute() fiber.Handler {
+func (h *Handler) commandsRoute(refreshFn func(*store.TokenRecord) (*store.TokenRecord, error)) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// slack-go expects a *http.Request; build a minimal one from the Fiber body.
 		req, err := http.NewRequest(http.MethodPost, "/", bytes.NewReader(c.Body()))
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).SendString("internal error")
@@ -62,7 +63,7 @@ func (h *Handler) commandsRoute() fiber.Handler {
 			return c.Status(fiber.StatusBadRequest).SendString("failed to parse command")
 		}
 
-		go h.HandleSlashCommand(cmd)
+		go h.HandleSlashCommand(cmd, refreshFn)
 
 		return c.SendStatus(fiber.StatusOK)
 	}

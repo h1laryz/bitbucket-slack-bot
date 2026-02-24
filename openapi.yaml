@@ -1,0 +1,250 @@
+openapi: "3.1.0"
+
+info:
+  title: git-slack-bot
+  version: "1.0.0"
+  description: Slack bot that surfaces Bitbucket data (PRs, repositories) via slash commands.
+
+servers:
+  - url: http://localhost:3000
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /bitbucket/oauth/callback:
+    get:
+      summary: Bitbucket OAuth2 callback
+      operationId: bitbucketOAuthCallback
+      description: |
+        Bitbucket redirects here after the user authorizes the OAuth consumer.
+        Exchanges the authorization code for access/refresh tokens and stores them.
+        Posts a success message to the originating Slack channel.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Encodes teamID:channelID:workspace
+      responses:
+        "200":
+          description: Bitbucket connected successfully
+        "400":
+          description: Missing or invalid parameters
+        "500":
+          description: Token exchange or storage failed
+
+  /bitbucket/webhook:
+    post:
+      summary: Bitbucket PR webhook
+      operationId: bitbucketWebhook
+      description: |
+        Receives Bitbucket webhook events. Only `pullrequest:created` events
+        trigger a Slack notification to all subscribed channels.
+        Configure in Bitbucket: Repository → Settings → Webhooks → Add webhook
+        URL: https://<host>/bitbucket/webhook — Trigger: Pull Request Created
+      parameters:
+        - name: X-Event-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            example: pullrequest:created
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BitbucketPRPayload"
+      responses:
+        "200":
+          description: Event received and queued
+        "400":
+          description: Invalid payload
+
+  /slack/events:
+    post:
+      summary: Slack Events API webhook
+      operationId: slackEvents
+      description: |
+        Receives Slack Events API payloads. Handles URL verification challenges
+        and app_mention events. Requests must include a valid Slack signature.
+      security:
+        - slackSignature: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/SlackUrlVerification"
+                - $ref: "#/components/schemas/SlackEventCallback"
+      responses:
+        "200":
+          description: Event acknowledged (or challenge response)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  challenge:
+                    type: string
+                    description: Echoed back only for url_verification requests
+        "400":
+          description: Invalid payload
+
+  /slack/commands:
+    post:
+      summary: Slack slash command webhook
+      operationId: slackCommands
+      description: |
+        Receives Slack slash command payloads. Requests must include a valid Slack signature.
+        Supported commands:
+        - `/bb-prs <repo-slug>` — list open pull requests for a repository
+        - `/bb-repos` — list all repositories in the connected workspace
+        - `/repo connect <workspace>` — connect Bitbucket via OAuth2
+        - `/repo add <workspace/repo>` — subscribe channel to PR notifications
+        - `/repo remove <workspace/repo>` — unsubscribe channel
+        - `/repo list` — list subscribed repositories in this channel
+      security:
+        - slackSignature: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: "#/components/schemas/SlackSlashCommand"
+      responses:
+        "200":
+          description: Command received and queued for processing
+        "400":
+          description: Failed to parse command
+
+components:
+  securitySchemes:
+    slackSignature:
+      type: apiKey
+      in: header
+      name: X-Slack-Signature
+      description: HMAC-SHA256 signature computed by Slack using the signing secret
+
+  schemas:
+    BitbucketPRPayload:
+      type: object
+      properties:
+        pullrequest:
+          type: object
+          properties:
+            id:
+              type: integer
+              example: 42
+            title:
+              type: string
+              example: "Add feature X"
+            source:
+              type: object
+              properties:
+                branch:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                      example: feature/x
+            destination:
+              type: object
+              properties:
+                branch:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                      example: main
+            author:
+              type: object
+              properties:
+                display_name:
+                  type: string
+                  example: John Doe
+            links:
+              type: object
+              properties:
+                html:
+                  type: object
+                  properties:
+                    href:
+                      type: string
+                      example: https://bitbucket.org/workspace/repo/pull-requests/42
+        repository:
+          type: object
+          properties:
+            full_name:
+              type: string
+              example: workspace/repo
+
+    SlackUrlVerification:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [url_verification]
+        challenge:
+          type: string
+
+    SlackEventCallback:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [event_callback]
+        team_id:
+          type: string
+        event:
+          type: object
+          properties:
+            type:
+              type: string
+              example: app_mention
+            user:
+              type: string
+            text:
+              type: string
+            channel:
+              type: string
+
+    SlackSlashCommand:
+      type: object
+      properties:
+        command:
+          type: string
+          enum: [/bb-prs, /bb-repos, /repo]
+        text:
+          type: string
+          description: Arguments passed to the command
+          example: "connect h1lary"
+        team_id:
+          type: string
+        channel_id:
+          type: string
+        user_id:
+          type: string
+        user_name:
+          type: string

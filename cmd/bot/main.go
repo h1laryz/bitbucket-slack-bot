@@ -8,17 +8,52 @@ import (
 	"syscall"
 	"time"
 
-	botapi "git-slack-bot/internal/api"
+	"git-slack-bot/internal/bitbucket"
 	"git-slack-bot/internal/config"
 	"git-slack-bot/internal/db"
 	slackbot "git-slack-bot/internal/slack"
 	"git-slack-bot/internal/store"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	slacklib "github.com/slack-go/slack"
 )
+
+// requestLogger returns a Fiber middleware that logs full request and response details.
+func requestLogger(log *slog.Logger) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		start := time.Now()
+
+		// Snapshot the body before handlers consume it (Fiber body is a byte slice, safe to read).
+		body := string(c.Body())
+
+		err := c.Next()
+
+		args := []any{
+			"method", c.Method(),
+			"url", c.OriginalURL(),
+			"status", c.Response().StatusCode(),
+			"latency", time.Since(start).String(),
+			"ip", c.IP(),
+		}
+		if body != "" {
+			args = append(args, "body", body)
+		}
+		// Log selected headers that are useful for debugging webhooks.
+		for _, h := range []string{
+			"Content-Type", "X-Event-Key", "X-Hub-Signature",
+			"X-Slack-Signature", "X-Slack-Request-Timestamp",
+		} {
+			if v := c.Get(h); v != "" {
+				args = append(args, h, v)
+			}
+		}
+
+		log.Info("http", args...)
+		return err
+	}
+}
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -31,7 +66,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Info("starting", "git-provider", cfg.GitProvider, "addr", cfg.ServerAddr)
+	log.Info("starting", "addr", cfg.ServerAddr)
 
 	// PostgreSQL connection pool.
 	pool, err := db.Connect(context.Background(), cfg.DatabaseURL)
@@ -42,17 +77,33 @@ func main() {
 	defer pool.Close()
 	log.Info("db connected", "max_conns", pool.Config().MaxConns)
 
-	// Per-team git credential store.
-	teamStore := store.New()
+	// DB-backed repo subscription + OAuth token store.
+	repoStore := store.NewRepoStore(pool)
+	if err := repoStore.Migrate(context.Background()); err != nil {
+		log.Error("db migrate error", "err", err)
+		os.Exit(1)
+	}
 
-	// Slack client (one per bot instance).
+	// Slack client.
 	slackClient := slacklib.New(cfg.SlackBotToken)
 
-	// Slack webhook handler — uses teamStore to look up credentials per request.
-	slackHandler := slackbot.NewHandler(slackClient, teamStore, cfg.GitProvider, log)
+	// Bitbucket OAuth handler.
+	oauthHandler := bitbucket.NewOAuthHandler(
+		cfg.BitbucketClientID,
+		cfg.BitbucketClientSecret,
+		cfg.PublicURL,
+		repoStore,
+		slackClient,
+		log,
+	)
 
-	// Management API handler — lets admins register team credentials.
-	apiHandler := botapi.NewHandler(teamStore)
+	// refreshFn wraps OAuthHandler.RefreshTokenBg for use in the Slack handler.
+	refreshFn := func(rec *store.TokenRecord) (*store.TokenRecord, error) {
+		return oauthHandler.RefreshTokenBg(context.Background(), rec)
+	}
+
+	// Slack webhook handler.
+	slackHandler := slackbot.NewHandler(slackClient, repoStore, oauthHandler.AuthURL, oauthHandler.AuthLoginURL, cfg.PublicURL, log)
 
 	// Fiber app.
 	app := fiber.New(fiber.Config{
@@ -61,17 +112,19 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	})
 
+	app.Use(cors.New())
 	app.Use(recover.New())
-	app.Use(logger.New(logger.Config{
-		Format: "[${time}] ${status} ${method} ${path} ${latency}\n",
-	}))
+	app.Use(requestLogger(log))
 
 	app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"status": "ok", "git_provider": cfg.GitProvider})
+		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
-	slackbot.RegisterRoutes(app, slackHandler, cfg.SlackSignSecret)
-	botapi.RegisterRoutes(app, apiHandler, cfg.APIKey)
+	slackbot.RegisterRoutes(app, slackHandler, cfg.SlackSignSecret, refreshFn)
+	bitbucket.RegisterRoutes(app,
+		bitbucket.NewWebhookHandler(slackClient, repoStore, log),
+		oauthHandler,
+	)
 
 	// Graceful shutdown.
 	quit := make(chan os.Signal, 1)

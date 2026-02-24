@@ -9,28 +9,30 @@ build:
 	go build -o ./build/bot ./cmd/bot
 
 .PHONY: start
-start:
+start: build
 	./build/bot \
-	--git-provider=bitbucket \
-  	--slack-bot-token=${SLACK_BOT_TOKEN} \
-  	--slack-signing-secret=${SLACK_SIGNING_SECRET} \
-  	--api-key=${API_KEY} \
-  	--db-url=${DATABASE_URL} \
-  	--addr=:3000
+	--slack-bot-token=${SLACK_BOT_TOKEN} \
+	--slack-signing-secret=${SLACK_SIGNING_SECRET} \
+	--bitbucket-client-id=${BITBUCKET_CLIENT_ID} \
+	--bitbucket-client-secret=${BITBUCKET_CLIENT_SECRET} \
+	--db-url=${DATABASE_URL} \
+	--public-url=${PUBLIC_URL} \
+	--addr=:3000
 
 .PHONY: docker-build docker-start
 docker-build:
-	docker build -t $(DOCKER_IMAGE) .
+	docker buildx build -t $(DOCKER_IMAGE) .
 
 docker-start: docker-build
 	docker run --rm \
 		--network=host \
 		$(DOCKER_IMAGE) \
-		--git-provider=bitbucket \
 		--slack-bot-token=${SLACK_BOT_TOKEN} \
 		--slack-signing-secret=${SLACK_SIGNING_SECRET} \
-		--api-key=${API_KEY} \
+		--bitbucket-client-id=${BITBUCKET_CLIENT_ID} \
+		--bitbucket-client-secret=${BITBUCKET_CLIENT_SECRET} \
 		--db-url=${DATABASE_URL} \
+		--public-url=${PUBLIC_URL} \
 		--addr=:3000
 
 .PHONY: format format-fix

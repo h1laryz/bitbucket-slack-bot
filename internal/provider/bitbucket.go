@@ -13,21 +13,16 @@ const bitbucketDefaultBaseURL = "https://api.bitbucket.org/2.0"
 type bitbucketClient struct {
 	baseURL    string
 	workspace  string
-	username   string
-	token      string
+	authHeader string
 	httpClient *http.Client
 }
 
-func newBitbucketClient(cfg TeamConfig) *bitbucketClient {
-	baseURL := cfg.BaseURL
-	if baseURL == "" {
-		baseURL = bitbucketDefaultBaseURL
-	}
+// NewOAuth creates a Bitbucket client authenticated with an OAuth2 access token.
+func NewOAuth(workspace, accessToken string) Provider {
 	return &bitbucketClient{
-		baseURL:    baseURL,
-		workspace:  cfg.Workspace,
-		username:   cfg.Username,
-		token:      cfg.Token,
+		baseURL:    bitbucketDefaultBaseURL,
+		workspace:  workspace,
+		authHeader: "Bearer " + accessToken,
 		httpClient: &http.Client{Timeout: 15 * time.Second},
 	}
 }
@@ -146,7 +141,7 @@ func (c *bitbucketClient) get(url string, out any) error {
 	if err != nil {
 		return err
 	}
-	req.SetBasicAuth(c.username, c.token)
+	req.Header.Set("Authorization", c.authHeader)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)

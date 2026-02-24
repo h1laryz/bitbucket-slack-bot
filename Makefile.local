@@ -1,5 +1,14 @@
 # Put local stuff here
 
+.PHONY: docker-run-swagger
+docker-run-swagger:
+	docker run -d --rm \
+		--name git-slack-bot-swagger \
+		-p 8080:8080 \
+		-e SWAGGER_JSON=/openapi.yaml \
+		-v $(CURDIR)/openapi.yaml:/openapi.yaml \
+		swaggerapi/swagger-ui
+
 .PHONY: docker-run-postgresql
 docker-run-postgresql:
 	docker run -d --rm \
