@@ -1,15 +1,18 @@
 package slack
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
-	"git-slack-bot/internal/provider"
-	"git-slack-bot/internal/store"
+	"bitbucket-slack-bot/internal/provider"
+	"bitbucket-slack-bot/internal/store"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -19,13 +22,13 @@ import (
 type Handler struct {
 	client    *slack.Client
 	repoStore *store.RepoStore
-	oauthURL  func(teamID, channelID, workspace string) string
+	oauthURL  func(teamID, channelID, userID, workspace string) string
 	loginURL  func(slackUserID, channelID string) string
 	publicURL string
 	log       *slog.Logger
 }
 
-func NewHandler(client *slack.Client, repoStore *store.RepoStore, oauthURL func(teamID, channelID, workspace string) string, loginURL func(slackUserID, channelID string) string, publicURL string, log *slog.Logger) *Handler {
+func NewHandler(client *slack.Client, repoStore *store.RepoStore, oauthURL func(teamID, channelID, userID, workspace string) string, loginURL func(slackUserID, channelID string) string, publicURL string, log *slog.Logger) *Handler {
 	return &Handler{
 		client:    client,
 		repoStore: repoStore,
@@ -64,14 +67,8 @@ func (h *Handler) HandleSlashCommand(cmd slack.SlashCommand, refreshFn func(rec 
 	h.log.Info("slash command", "command", cmd.Command, "text", cmd.Text, "user", cmd.UserName, "team", cmd.TeamID)
 
 	switch cmd.Command {
-	case "/bb-prs":
-		h.handlePRsCommand(cmd, refreshFn)
-	case "/bb-repos":
-		h.handleReposCommand(cmd, refreshFn)
 	case "/repo":
-		h.handleRepoCommand(cmd, refreshFn)
-	case "/login":
-		h.handleLoginCommand(cmd)
+		h.handleRepoCommand(cmd)
 	default:
 		h.respond(cmd.ChannelID, fmt.Sprintf("Unknown command: `%s`", cmd.Command))
 	}
@@ -90,108 +87,20 @@ func (h *Handler) handleCallbackEvent(event slackevents.EventsAPIEvent) {
 	case *slackevents.AppMentionEvent:
 		h.log.Info("app mention", "user", ev.User, "text", ev.Text)
 		h.respond(ev.Channel, fmt.Sprintf(
-			"Hi <@%s>! Try `/bb-prs <repo>`, `/bb-repos`, or `/repo add <workspace/repo>`.\nNot connected yet? Use `/repo connect <workspace>`.",
+			"Hi <@%s>! Use `/repo connect <workspace>` to connect Bitbucket, `/repo add <workspace/repo>` to subscribe a channel, or `/repo list` to see subscriptions.",
 			ev.User,
 		))
 	}
 }
 
-func (h *Handler) handlePRsCommand(cmd slack.SlashCommand, refreshFn func(*store.TokenRecord) (*store.TokenRecord, error)) {
-	repo := strings.TrimSpace(cmd.Text)
-	if repo == "" {
-		h.respond(cmd.ChannelID, "Usage: `/bb-prs <repo-slug>`")
-		return
-	}
-
-	git, err := h.gitFor(cmd.TeamID, refreshFn)
-	if err != nil {
-		h.respond(cmd.ChannelID, fmt.Sprintf(":x: %v", err))
-		return
-	}
-	if git == nil {
-		h.sendConnectPrompt(cmd.ChannelID, cmd.TeamID, "")
-		return
-	}
-
-	prs, err := git.ListOpenPRs(repo)
-	if err != nil {
-		h.log.Error("list PRs failed", "repo", repo, "team", cmd.TeamID, "err", err)
-		h.respond(cmd.ChannelID, fmt.Sprintf("Failed to fetch PRs for `%s`: %v", repo, err))
-		return
-	}
-
-	if len(prs) == 0 {
-		h.respond(cmd.ChannelID, fmt.Sprintf("No open pull requests in `%s`.", repo))
-		return
-	}
-
-	blocks := []slack.Block{
-		slack.NewHeaderBlock(slack.NewTextBlockObject(slack.PlainTextType,
-			fmt.Sprintf("Open PRs in %s (%d)", repo, len(prs)), false, false)),
-	}
-
-	for _, pr := range prs {
-		text := fmt.Sprintf("*<%s|#%d: %s>*\n%s → %s | by %s",
-			pr.URL, pr.ID, pr.Title,
-			pr.SourceBranch, pr.TargetBranch,
-			pr.Author,
-		)
-		blocks = append(blocks,
-			slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil),
-			slack.NewDividerBlock(),
-		)
-	}
-
-	_, _, err = h.client.PostMessage(cmd.ChannelID, slack.MsgOptionBlocks(blocks...))
-	if err != nil {
-		h.log.Error("post message failed", "err", err)
-	}
-}
-
-func (h *Handler) handleReposCommand(cmd slack.SlashCommand, refreshFn func(*store.TokenRecord) (*store.TokenRecord, error)) {
-	git, err := h.gitFor(cmd.TeamID, refreshFn)
-	if err != nil {
-		h.respond(cmd.ChannelID, fmt.Sprintf(":x: %v", err))
-		return
-	}
-	if git == nil {
-		h.sendConnectPrompt(cmd.ChannelID, cmd.TeamID, "")
-		return
-	}
-
-	repos, err := git.ListRepos()
-	if err != nil {
-		h.log.Error("list repos failed", "team", cmd.TeamID, "err", err)
-		h.respond(cmd.ChannelID, fmt.Sprintf("Failed to fetch repositories: %v", err))
-		return
-	}
-
-	if len(repos) == 0 {
-		h.respond(cmd.ChannelID, "No repositories found in workspace.")
-		return
-	}
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("*Repositories (%d)*\n", len(repos)))
-	for _, r := range repos {
-		sb.WriteString(fmt.Sprintf("• <%s|%s>", r.URL, r.FullName))
-		if r.Description != "" {
-			sb.WriteString(" — " + r.Description)
-		}
-		sb.WriteString("\n")
-	}
-
-	h.respond(cmd.ChannelID, sb.String())
-}
-
 // handleRepoCommand handles the /repo slash command with subcommands:
 //
-//	/repo connect <workspace>      — connect Bitbucket account via OAuth
-//	/repo add <workspace/repo>     — subscribe this channel to PR notifications
-//	/repo remove <workspace/repo>  — unsubscribe
-//	/repo list                     — list subscriptions for this channel
-func (h *Handler) handleRepoCommand(cmd slack.SlashCommand, refreshFn func(*store.TokenRecord) (*store.TokenRecord, error)) {
-	const usage = "Usage: `/repo connect <workspace>`, `/repo add <workspace/repo>`, `/repo remove <workspace/repo>`, `/repo list`"
+//	/repo connect <workspace>   — connect Bitbucket account via OAuth
+//	/repo add <workspace/repo>  — subscribe this channel to PR notifications
+//	/repo list                  — list subscriptions (ephemeral)
+//	/repo delete                — remove subscriptions via buttons (ephemeral)
+func (h *Handler) handleRepoCommand(cmd slack.SlashCommand) {
+	const usage = "Usage: `/repo connect <workspace>`, `/repo add <workspace/repo>`, `/repo list`, `/repo delete`"
 
 	parts := strings.Fields(cmd.Text)
 	if len(parts) == 0 {
@@ -199,107 +108,10 @@ func (h *Handler) handleRepoCommand(cmd slack.SlashCommand, refreshFn func(*stor
 		return
 	}
 
-	ctx := context.Background()
-
 	switch parts[0] {
-	case "connect":
-		if len(parts) < 2 {
-			h.respond(cmd.ChannelID, "Usage: `/repo connect <workspace>`")
-			return
-		}
-		workspace := parts[1]
-		authURL := h.oauthURL(cmd.TeamID, cmd.ChannelID, workspace)
-		h.respond(cmd.ChannelID, fmt.Sprintf(
-			":key: Click the link below to connect Bitbucket workspace `%s` to this Slack team:\n<%s|Connect Bitbucket>",
-			workspace, authURL,
-		))
-
-	case "add":
-		if len(parts) < 2 {
-			h.respond(cmd.ChannelID, "Usage: `/repo add <workspace/repo>`")
-			return
-		}
-		repoSlug := normalizeRepoSlug(parts[1])
-
-		rec, err := h.repoStore.GetToken(ctx, cmd.TeamID)
-		if err != nil {
-			h.respond(cmd.ChannelID, ":x: Failed to check connection status")
-			return
-		}
-		if rec == nil {
-			h.sendConnectPrompt(cmd.ChannelID, cmd.TeamID, "")
-			return
-		}
-
-		if err := h.repoStore.Subscribe(ctx, cmd.ChannelID, cmd.TeamID, repoSlug); err != nil {
-			h.log.Error("subscribe repo", "repo", repoSlug, "err", err)
-			h.respond(cmd.ChannelID, fmt.Sprintf(":x: Failed to subscribe to `%s`", repoSlug))
-			return
-		}
-		secret, err := h.repoStore.GetOrCreateWebhookSecret(ctx, repoSlug)
-		if err != nil {
-			h.log.Error("get webhook secret", "repo", repoSlug, "err", err)
-			h.respond(cmd.ChannelID, ":x: Failed to generate webhook secret")
-			return
-		}
-		webhookURL := h.publicURL + "/bitbucket/webhook"
-		h.respond(cmd.ChannelID, fmt.Sprintf(
-			":white_check_mark: This channel will now receive PR notifications for `%s`.\n\n"+
-				"*Next step:* add this webhook in Bitbucket:\n"+
-				"Repository → Settings → Webhooks → Add webhook\n"+
-				"• URL: `%s`\n"+
-				"• Secret: `%s`\n"+
-				"• Trigger: *Pull Request → Created*",
-			repoSlug, webhookURL, secret,
-		))
-
-	case "remove":
-		if len(parts) < 2 {
-			h.respond(cmd.ChannelID, "Usage: `/repo remove <workspace/repo>`")
-			return
-		}
-		repoSlug := parts[1]
-		if err := h.repoStore.Unsubscribe(ctx, cmd.ChannelID, repoSlug); err != nil {
-			h.log.Error("unsubscribe repo", "repo", repoSlug, "err", err)
-			h.respond(cmd.ChannelID, fmt.Sprintf(":x: Failed to unsubscribe from `%s`", repoSlug))
-			return
-		}
-		h.respond(cmd.ChannelID, fmt.Sprintf(":white_check_mark: Unsubscribed from `%s`", repoSlug))
-
-	case "list":
-		repos, err := h.repoStore.ListForChannel(ctx, cmd.ChannelID)
-		if err != nil {
-			h.log.Error("list repo subscriptions", "channel", cmd.ChannelID, "err", err)
-			h.respond(cmd.ChannelID, ":x: Failed to fetch subscriptions")
-			return
-		}
-		if len(repos) == 0 {
-			h.respond(cmd.ChannelID, "No repositories subscribed in this channel. Use `/repo add <workspace/repo>` to subscribe.")
-			return
-		}
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("*Subscribed repositories (%d)*\n", len(repos)))
-		for _, r := range repos {
-			sb.WriteString(fmt.Sprintf("• `%s`\n", r))
-		}
-		h.respond(cmd.ChannelID, sb.String())
-
 	default:
 		h.respond(cmd.ChannelID, usage)
 	}
-}
-
-// sendConnectPrompt posts a message asking the user to connect Bitbucket.
-func (h *Handler) sendConnectPrompt(channelID, teamID, workspace string) {
-	if workspace == "" {
-		h.respond(channelID, ":warning: Bitbucket is not connected yet. Run `/repo connect <workspace>` to get started.")
-		return
-	}
-	authURL := h.oauthURL(teamID, channelID, workspace)
-	h.respond(channelID, fmt.Sprintf(
-		":warning: Bitbucket is not connected yet. <%s|Click here to connect workspace `%s`>.",
-		authURL, workspace,
-	))
 }
 
 // normalizeRepoSlug extracts "workspace/repo" from either a full Bitbucket URL
@@ -320,12 +132,205 @@ func normalizeRepoSlug(input string) string {
 	return strings.Trim(input, "/")
 }
 
-func (h *Handler) handleLoginCommand(cmd slack.SlashCommand) {
+// slashResponse is the JSON body returned directly to a slash command request.
+type slashResponse struct {
+	ResponseType string        `json:"response_type"`
+	Text         string        `json:"text,omitempty"`
+	Blocks       []slack.Block `json:"blocks,omitempty"`
+}
+
+// interactionReply is the JSON body returned to a Slack block-actions interaction.
+type interactionReply struct {
+	ReplaceOriginal bool          `json:"replace_original"`
+	Text            string        `json:"text,omitempty"`
+	Blocks          []slack.Block `json:"blocks,omitempty"`
+}
+
+// repoSubResponse handles /repo connect and /repo add inline, returning an ephemeral response.
+func (h *Handler) repoSubResponse(cmd slack.SlashCommand) slashResponse {
+	parts := strings.Fields(cmd.Text)
+	switch parts[0] {
+	case "connect":
+		if len(parts) < 2 {
+			return slashResponse{ResponseType: "ephemeral", Text: "Usage: `/repo connect <workspace>`"}
+		}
+		workspace := parts[1]
+		authURL := h.oauthURL(cmd.TeamID, cmd.ChannelID, cmd.UserID, workspace)
+		return slashResponse{
+			ResponseType: "ephemeral",
+			Text: fmt.Sprintf(
+				":key: Click the link below to connect Bitbucket workspace `%s` to this Slack team:\n<%s|Connect Bitbucket>",
+				workspace, authURL,
+			),
+		}
+
+	case "add":
+		if len(parts) < 2 {
+			return slashResponse{ResponseType: "ephemeral", Text: "Usage: `/repo add <workspace/repo>`"}
+		}
+		repoSlug := normalizeRepoSlug(parts[1])
+		ctx := context.Background()
+
+		rec, err := h.repoStore.GetToken(ctx, cmd.TeamID)
+		if err != nil {
+			return slashResponse{ResponseType: "ephemeral", Text: ":x: Failed to check connection status"}
+		}
+		if rec == nil {
+			return slashResponse{ResponseType: "ephemeral", Text: ":warning: Bitbucket is not connected yet. Run `/repo connect <workspace>` to get started."}
+		}
+
+		if err := h.repoStore.Subscribe(ctx, cmd.ChannelID, cmd.TeamID, repoSlug); err != nil {
+			h.log.Error("subscribe repo", "repo", repoSlug, "err", err)
+			return slashResponse{ResponseType: "ephemeral", Text: fmt.Sprintf(":x: Failed to subscribe to `%s`", repoSlug)}
+		}
+
+		secret, err := h.repoStore.GetOrCreateWebhookSecret(ctx, repoSlug)
+		if err != nil {
+			h.log.Error("get webhook secret", "repo", repoSlug, "err", err)
+			return slashResponse{ResponseType: "ephemeral", Text: ":x: Failed to generate webhook secret"}
+		}
+
+		webhookURL := h.publicURL + "/bitbucket/webhook"
+		return slashResponse{
+			ResponseType: "ephemeral",
+			Text: fmt.Sprintf(
+				":white_check_mark: This channel will now receive PR notifications for `%s`.\n\n"+
+					"*Next step:* add this webhook in Bitbucket:\n"+
+					"Repository → Settings → Webhooks → Add webhook\n"+
+					"• URL: `%s`\n"+
+					"• Secret: `%s`\n"+
+					"• Triggers: *ALL*",
+				repoSlug, webhookURL, secret,
+			),
+		}
+
+	case "list":
+		ctx := context.Background()
+		repos, err := h.repoStore.ListForChannel(ctx, cmd.ChannelID)
+		if err != nil {
+			return slashResponse{ResponseType: "ephemeral", Text: ":x: Failed to fetch subscriptions"}
+		}
+		if len(repos) == 0 {
+			return slashResponse{ResponseType: "ephemeral", Text: "No repositories subscribed in this channel."}
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("*Subscribed repositories (%d)*\n", len(repos)))
+		for _, r := range repos {
+			sb.WriteString(fmt.Sprintf("• `%s`\n", normalizeRepoSlug(r)))
+		}
+		return slashResponse{ResponseType: "ephemeral", Text: sb.String()}
+
+	case "delete":
+		ctx := context.Background()
+		repos, err := h.repoStore.ListForChannel(ctx, cmd.ChannelID)
+		if err != nil {
+			return slashResponse{ResponseType: "ephemeral", Text: ":x: Failed to fetch subscriptions"}
+		}
+		return slashResponse{ResponseType: "ephemeral", Blocks: buildRepoDeleteBlocks(repos)}
+
+	}
+
+	return slashResponse{ResponseType: "ephemeral", Text: "Usage: `/repo connect <workspace>`, `/repo add <workspace/repo>`, `/repo list`, `/repo delete`"}
+}
+
+// buildRepoDeleteBlocks builds a Block Kit list of repos with a Delete button on each row.
+func buildRepoDeleteBlocks(repos []string) []slack.Block {
+	if len(repos) == 0 {
+		return []slack.Block{
+			slack.NewSectionBlock(
+				slack.NewTextBlockObject(slack.MarkdownType, "No repositories subscribed in this channel.", false, false),
+				nil, nil,
+			),
+		}
+	}
+	blocks := []slack.Block{
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject(slack.MarkdownType,
+				fmt.Sprintf("*Subscribed repositories (%d)*\nClick *Delete* to unsubscribe:", len(repos)),
+				false, false),
+			nil, nil,
+		),
+		slack.NewDividerBlock(),
+	}
+	for _, repo := range repos {
+		display := normalizeRepoSlug(repo)
+		btn := slack.NewButtonBlockElement("repo_delete", repo,
+			slack.NewTextBlockObject(slack.PlainTextType, "Delete", false, false))
+		btn.Style = slack.StyleDanger
+		blocks = append(blocks,
+			slack.NewSectionBlock(
+				slack.NewTextBlockObject(slack.MarkdownType, fmt.Sprintf("`%s`", display), false, false),
+				nil,
+				slack.NewAccessory(btn),
+			),
+		)
+	}
+	return blocks
+}
+
+// HandleInteraction processes Slack block_actions payloads (e.g. Delete repo buttons).
+// It posts the updated message to payload.ResponseURL so ephemeral messages are updated correctly.
+func (h *Handler) HandleInteraction(payload slack.InteractionCallback) {
+	if payload.Type != slack.InteractionTypeBlockActions {
+		return
+	}
+
+	for _, action := range payload.ActionCallback.BlockActions {
+		if action.ActionID == "repo_delete" {
+			channelID := payload.Channel.ID
+			repoSlug := action.Value
+
+			if err := h.repoStore.Unsubscribe(context.Background(), channelID, repoSlug); err != nil {
+				h.log.Error("unsubscribe repo via button", "repo", repoSlug, "err", err)
+			}
+
+			repos, _ := h.repoStore.ListForChannel(context.Background(), channelID)
+			confirm := slack.NewSectionBlock(
+				slack.NewTextBlockObject(slack.MarkdownType,
+					fmt.Sprintf(":white_check_mark: Unsubscribed from `%s`", normalizeRepoSlug(repoSlug)),
+					false, false),
+				nil, nil,
+			)
+			h.postToResponseURL(payload.ResponseURL, interactionReply{
+				ReplaceOriginal: true,
+				Blocks:          append([]slack.Block{confirm, slack.NewDividerBlock()}, buildRepoDeleteBlocks(repos)...),
+			})
+			return
+		}
+	}
+}
+
+// postToResponseURL POSTs a JSON reply to a Slack response_url.
+func (h *Handler) postToResponseURL(responseURL string, reply interactionReply) {
+	body, err := json.Marshal(reply)
+	if err != nil {
+		h.log.Error("marshal interaction reply", "err", err)
+		return
+	}
+	resp, err := http.Post(responseURL, "application/json", bytes.NewReader(body)) //nolint:noctx
+	if err != nil {
+		h.log.Error("post to response_url", "err", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+// loginResponse builds an ephemeral inline response for the /login command.
+func (h *Handler) loginResponse(cmd slack.SlashCommand) slashResponse {
+	if cmd.ChannelName != "directmessage" {
+		return slashResponse{
+			ResponseType: "ephemeral",
+			Text:         ":lock: `/login` can only be used in a direct message with the bot.",
+		}
+	}
 	authURL := h.loginURL(cmd.UserID, cmd.ChannelID)
-	h.respond(cmd.ChannelID, fmt.Sprintf(
-		":key: <@%s>, click the link below to link your Bitbucket account:\\n<%s|Connect your Bitbucket account>",
-		cmd.UserID, authURL,
-	))
+	return slashResponse{
+		ResponseType: "ephemeral",
+		Text: fmt.Sprintf(
+			":key: <@%s>, click the link below to link your Bitbucket account:\n<%s|Connect your Bitbucket account>",
+			cmd.UserID, authURL,
+		),
+	}
 }
 
 func (h *Handler) respond(channelID, text string) {

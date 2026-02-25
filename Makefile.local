@@ -3,7 +3,7 @@
 .PHONY: docker-run-swagger
 docker-run-swagger:
 	docker run -d --rm \
-		--name git-slack-bot-swagger \
+		--name bitbucket-slack-bot-swagger \
 		-p 8080:8080 \
 		-e SWAGGER_JSON=/openapi.yaml \
 		-v $(CURDIR)/openapi.yaml:/openapi.yaml \
@@ -12,7 +12,7 @@ docker-run-swagger:
 .PHONY: docker-run-postgresql
 docker-run-postgresql:
 	docker run -d --rm \
-		--name git-slack-bot-postgres \
+		--name bitbucket-slack-bot-postgres \
 		-p 5432:5432 \
 		-e POSTGRES_USER=${POSTGRES_USER} \
 		-e POSTGRES_PASSWORD=${POSTGRES_PASSWORD} \

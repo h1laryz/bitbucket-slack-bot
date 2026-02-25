@@ -1,4 +1,4 @@
-module git-slack-bot
+module bitbucket-slack-bot
 
 go 1.25.3
 

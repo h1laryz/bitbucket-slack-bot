@@ -1,7 +1,7 @@
 include .env
 include Makefile.local
 
-DOCKER_IMAGE ?= git-slack-bot
+DOCKER_IMAGE ?= bitbucket-slack-bot
 
 .PHONY: build
 build:
@@ -17,7 +17,7 @@ start: build
 	--bitbucket-client-secret=${BITBUCKET_CLIENT_SECRET} \
 	--db-url=${DATABASE_URL} \
 	--public-url=${PUBLIC_URL} \
-	--addr=:3000
+--addr=:3000
 
 .PHONY: docker-build docker-start
 docker-build:

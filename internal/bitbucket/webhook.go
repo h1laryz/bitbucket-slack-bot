@@ -10,7 +10,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"git-slack-bot/internal/store"
+	"bitbucket-slack-bot/internal/store"
 
 	"github.com/gofiber/fiber/v2"
 	slacklib "github.com/slack-go/slack"
@@ -324,7 +324,8 @@ func (h *WebhookHandler) onPRComment(p bbEventPayload) {
 	h.threadReply(p.Repository.FullName, p.PullRequest.ID, reply)
 }
 
-// onCommitStatus saves the build status and silently updates all Slack PR cards for that commit.
+// onCommitStatus saves the build status, updates all Slack PR cards for that commit,
+// and posts a thread reply describing the build result.
 func (h *WebhookHandler) onCommitStatus(p bbCommitStatusPayload) {
 	ctx := context.Background()
 	repoSlug := p.Repository.FullName
@@ -343,6 +344,7 @@ func (h *WebhookHandler) onCommitStatus(p bbCommitStatusPayload) {
 	}
 
 	buildLabel := formatBuildLabel(p.CommitStatus.State, p.CommitStatus.Name, p.CommitStatus.URL)
+	replyText := buildStatusReply(p.CommitStatus.State, p.CommitStatus.Name, p.CommitStatus.URL)
 
 	for _, prID := range prIDs {
 		rec, err := h.repoStore.GetPRCommit(ctx, repoSlug, prID)
@@ -388,9 +390,39 @@ func (h *WebhookHandler) onCommitStatus(p bbCommitStatusPayload) {
 			if _, _, _, err := h.slack.UpdateMessage(msg.ChannelID, msg.MessageTS, slacklib.MsgOptionBlocks(blocks...)); err != nil {
 				h.log.Error("update PR message on build status", "channel", msg.ChannelID, "err", err)
 			}
+			if _, _, err := h.slack.PostMessage(msg.ChannelID,
+				slacklib.MsgOptionTS(msg.MessageTS),
+				slacklib.MsgOptionText(replyText, false),
+			); err != nil {
+				h.log.Error("post build status thread reply", "channel", msg.ChannelID, "err", err)
+			}
 		}
 		h.log.Info("PR card updated for build status", "repo", repoSlug, "pr", prID, "state", p.CommitStatus.State)
 	}
+}
+
+// buildStatusReply formats a build state/name/url into a thread-reply string.
+func buildStatusReply(state, name, url string) string {
+	var prefix string
+	switch strings.ToUpper(state) {
+	case "INPROGRESS":
+		prefix = ":hourglass_flowing_sand: Build started"
+	case "SUCCESSFUL":
+		prefix = ":white_check_mark: Build passed"
+	case "FAILED":
+		prefix = ":x: Build failed"
+	case "STOPPED":
+		prefix = ":octagonal_sign: Build stopped"
+	default:
+		prefix = ":grey_question: Build: " + state
+	}
+	if url != "" {
+		return fmt.Sprintf("%s: <%s|%s>", prefix, url, name)
+	}
+	if name != "" {
+		return prefix + ": " + name
+	}
+	return prefix
 }
 
 // buildApprovalStatus returns a status line listing all approvers, or "" if none.

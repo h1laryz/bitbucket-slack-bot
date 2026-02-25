@@ -1,119 +1,181 @@
-# git-slack-bot
+# bitbucket-slack-bot
 
-A Slack bot that integrates with git hosting providers (Bitbucket, GitHub planned).
-Supports multiple Slack workspaces — each workspace configures its own credentials via the management API.
+A Slack bot that forwards Bitbucket pull request activity to Slack channels in real time. Supports multiple Slack workspaces — each workspace connects its own Bitbucket account via OAuth2.
 
 ## Features
 
-- `/bb-prs <repo>` — list open pull requests for a repository
-- `/bb-repos` — list all repositories in the workspace
-- Multi-tenant: each Slack workspace has its own git credentials
-- Provider-agnostic architecture — adding GitHub requires no changes to the Slack layer
+- Real-time PR notifications: opened, merged, declined, approved, unapproved, commented
+- Pipeline build status updates on the PR card (started / passed / failed / stopped)
+- Thread replies for every PR event and build update
+- Per-channel repository subscriptions
+- Bitbucket OAuth2 — no manual credential setup, workspaces connect via browser
+- User identity linking — Bitbucket display names → Slack mentions
+- All bot responses are ephemeral (only visible to you)
+
+## Slash commands
+
+| Command | Description |
+|---|---|
+| `/repo connect <workspace>` | Connect a Bitbucket workspace to this Slack team via OAuth |
+| `/repo add <workspace/repo>` | Subscribe the current channel to PR notifications for a repository |
+| `/repo list` | List all subscribed repositories in the current channel |
+| `/repo delete` | Show subscribed repositories with Delete buttons |
+| `/login` | Link your Bitbucket account for direct Slack mentions (DM only) |
+
+## PR card
+
+Each PR notification is posted as a structured card and updated in-place as the PR progresses:
+
+```
+Pull request               Repository
+#42: Fix login bug         workspace/my-repo
+
+Build                      Branch
+✅ Build passed: CI        feature/fix → main
+
+Reviewers                  Author
+@alice, @bob               @carol
+```
+
+Thread replies are posted for: approved, unapproved, commented, merged, declined, build started/passed/failed/stopped.
 
 ## Requirements
 
-- Go 1.21+
-- A Slack app with bot token and signing secret ([api.slack.com/apps](https://api.slack.com/apps))
-- A Bitbucket app password ([bitbucket.org/account/settings/app-passwords](https://bitbucket.org/account/settings/app-passwords))
+- Go 1.25+
+- PostgreSQL
+- A Slack app ([api.slack.com/apps](https://api.slack.com/apps))
+- A Bitbucket OAuth2 consumer ([bitbucket.org/account/settings/api](https://bitbucket.org/account/settings/api))
+- A public URL for webhooks (e.g. [ngrok](https://ngrok.com))
 
-## Build
+## Setup
 
-```bash
-go build -o bot ./cmd/bot
+### 1. Bitbucket OAuth consumer
+
+1. Go to Bitbucket → Workspace settings → OAuth consumers → **Add consumer**
+2. Callback URL: `https://<your-public-url>/bitbucket/oauth/callback`
+3. Permissions: **Repositories** (Read), **Pull requests** (Read), **Account** (Read)
+4. Copy the **Key** (client ID) and **Secret**
+
+### 2. Slack app
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App**
+2. **OAuth & Permissions** → Bot Token Scopes:
+   - `chat:write`
+   - `chat:write.public`
+   - `commands`
+   - `app_mentions:read`
+3. **Slash Commands** → create the following, all pointing to `https://<your-public-url>/slack/commands`:
+   - `/repo`
+   - `/login`
+4. **Interactivity & Shortcuts** → enable, set Request URL to `https://<your-public-url>/slack/interactions`
+5. **Event Subscriptions** → enable, set Request URL to `https://<your-public-url>/slack/events`, subscribe to `app_mention`
+6. Install the app to your workspace and copy the **Bot Token** and **Signing Secret**
+
+### 3. PostgreSQL
+
+Create a database and user:
+
+```sql
+CREATE USER gitslackbot WITH PASSWORD 'password';
+CREATE DATABASE gitslackbot OWNER gitslackbot;
 ```
 
-## Run
+### 4. Environment
 
-All configuration is passed as CLI flags — no `.env` file needed.
+Copy `.env.example` to `.env` and fill in your values:
+
+```env
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_SIGNING_SECRET=...
+BITBUCKET_CLIENT_ID=...
+BITBUCKET_CLIENT_SECRET=...
+DATABASE_URL=postgres://gitslackbot:password@localhost:5432/gitslackbot
+PUBLIC_URL=https://your-ngrok-url.ngrok-free.app
+```
+
+### 5. Run
 
 ```bash
-./bot \
-  --git-provider=bitbucket \
-  --slack-bot-token=xoxb-your-bot-token \
-  --slack-signing-secret=your-signing-secret \
-  --api-key=your-admin-secret \
+make start
+```
+
+Or build and run manually:
+
+```bash
+go build -o ./build/bot ./cmd/bot
+
+./build/bot \
+  --slack-bot-token=xoxb-... \
+  --slack-signing-secret=... \
+  --bitbucket-client-id=... \
+  --bitbucket-client-secret=... \
+  --db-url=postgres://gitslackbot:password@localhost:5432/gitslackbot \
+  --public-url=https://your-ngrok-url.ngrok-free.app \
   --addr=:3000
 ```
 
 | Flag | Required | Default | Description |
 |---|---|---|---|
-| `--git-provider` | yes | — | Git hosting backend: `bitbucket`, `github` |
 | `--slack-bot-token` | yes | — | Slack bot token (`xoxb-…`) |
 | `--slack-signing-secret` | yes | — | Slack signing secret |
-| `--api-key` | yes | — | Bearer token protecting `/api/teams/*` endpoints |
+| `--bitbucket-client-id` | yes | — | Bitbucket OAuth2 consumer key |
+| `--bitbucket-client-secret` | yes | — | Bitbucket OAuth2 consumer secret |
+| `--db-url` | yes | — | PostgreSQL connection URL |
+| `--public-url` | yes | — | Externally reachable base URL |
 | `--addr` | no | `:3000` | Server listen address |
 
-## Slack app setup
-
-In your Slack app settings:
-
-1. **OAuth & Permissions** → Bot Token Scopes: `chat:write`, `commands`, `app_mentions:read`
-2. **Slash Commands** → create `/bb-prs` and `/bb-repos` pointing to `https://your-host/slack/commands`
-3. **Event Subscriptions** → request URL: `https://your-host/slack/events`, subscribe to `app_mention`
-
-## Team configuration API
-
-Before a Slack workspace can use the bot, an admin must register the git credentials for that workspace. The Slack `team_id` is visible in Slack's slash command payloads.
-
-### Register or update credentials
+### 6. Docker
 
 ```bash
-curl -X POST http://localhost:3000/api/teams/<slack-team-id>/config \
-  -H "Authorization: Bearer your-admin-secret" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "workspace": "my-workspace",
-    "username":  "jdoe",
-    "token":     "app-password",
-    "base_url":  ""
-  }'
+# Build and run locally
+make docker-start
+
+# Or pull from GitHub Container Registry
+docker pull ghcr.io/h1lary/bitbucket-slack-bot:latest
+docker run --rm \
+  ghcr.io/h1lary/bitbucket-slack-bot:latest \
+  --slack-bot-token=xoxb-... \
+  --slack-signing-secret=... \
+  --bitbucket-client-id=... \
+  --bitbucket-client-secret=... \
+  --db-url=postgres://... \
+  --public-url=https://...
 ```
 
-`base_url` is optional — defaults to `https://api.bitbucket.org/2.0` for Bitbucket.
+## Connecting a workspace
 
-### Get current config (token is masked)
+Once the bot is running:
 
-```bash
-curl http://localhost:3000/api/teams/<slack-team-id>/config \
-  -H "Authorization: Bearer your-admin-secret"
-```
+1. In Slack, run `/repo connect <your-bitbucket-workspace>`
+2. Click the OAuth link — authorize in the browser
+3. You'll see a confirmation in Slack
+4. Run `/repo add <workspace/repo>` to subscribe a channel
+5. In Bitbucket → Repository settings → Webhooks → Add webhook:
+   - URL: `https://<your-public-url>/bitbucket/webhook`
+   - Secret: shown by `/repo add` (copy it exactly)
+   - Triggers: select **All**
 
-### List all configured teams
+## Linking your Bitbucket account
 
-```bash
-curl http://localhost:3000/api/teams \
-  -H "Authorization: Bearer your-admin-secret"
-```
-
-### Remove credentials
-
-```bash
-curl -X DELETE http://localhost:3000/api/teams/<slack-team-id>/config \
-  -H "Authorization: Bearer your-admin-secret"
-```
+Send the bot a DM and run `/login`. Click the link to authorize. After that, your Bitbucket display name will be resolved to your Slack mention in PR cards and thread replies.
 
 ## Health check
 
 ```bash
-curl http://localhost:3000/health
-# {"status":"ok","git_provider":"bitbucket"}
+curl https://<your-public-url>/health
+# {"status":"ok"}
 ```
 
 ## Project structure
 
 ```
-cmd/bot/            entry point
+cmd/bot/              entry point, wiring
 internal/
-  config/           CLI flag parsing
-  provider/         git provider interface + Bitbucket implementation
-  store/            in-memory per-team credential store
-  api/              management REST API (team config CRUD)
-  slack/            Slack webhook handler, slash commands, signature verification
+  config/             CLI flag parsing
+  db/                 PostgreSQL connection pool
+  provider/           Bitbucket API client (OAuth bearer auth)
+  store/              PostgreSQL store — subscriptions, tokens, PR messages, build statuses
+  bitbucket/          Webhook handler, OAuth2 callback
+  slack/              Slash commands, events, interactions, signature verification
+.github/workflows/    Docker build + push to ghcr.io on every push to main
 ```
-
-## Adding a new git provider
-
-1. Create `internal/provider/<name>.go` implementing the `provider.Provider` interface
-2. Register it in `provider.New()` in [internal/provider/provider.go](internal/provider/provider.go)
-3. Add the new type constant to `ParseType()`
-4. Pass `--git-provider=<name>` at startup

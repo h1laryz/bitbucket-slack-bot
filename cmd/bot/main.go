@@ -8,11 +8,11 @@ import (
 	"syscall"
 	"time"
 
-	"git-slack-bot/internal/bitbucket"
-	"git-slack-bot/internal/config"
-	"git-slack-bot/internal/db"
-	slackbot "git-slack-bot/internal/slack"
-	"git-slack-bot/internal/store"
+	"bitbucket-slack-bot/internal/bitbucket"
+	"bitbucket-slack-bot/internal/config"
+	"bitbucket-slack-bot/internal/db"
+	slackbot "bitbucket-slack-bot/internal/slack"
+	"bitbucket-slack-bot/internal/store"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
@@ -107,7 +107,7 @@ func main() {
 
 	// Fiber app.
 	app := fiber.New(fiber.Config{
-		AppName:      "git-slack-bot",
+		AppName:      "bitbucket-slack-bot",
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	})

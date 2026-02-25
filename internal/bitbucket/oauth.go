@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"git-slack-bot/internal/store"
+	"bitbucket-slack-bot/internal/store"
 
 	"github.com/gofiber/fiber/v2"
 	slacklib "github.com/slack-go/slack"
@@ -41,9 +41,9 @@ func NewOAuthHandler(clientID, clientSecret, publicURL string, repoStore *store.
 }
 
 // AuthURL returns the Bitbucket OAuth2 authorization URL for workspace connect.
-// state encodes "connect:teamID:channelID:workspace".
-func (h *OAuthHandler) AuthURL(teamID, channelID, workspace string) string {
-	state := "connect:" + teamID + ":" + channelID + ":" + workspace
+// state encodes "connect:teamID:channelID:userID:workspace".
+func (h *OAuthHandler) AuthURL(teamID, channelID, userID, workspace string) string {
+	state := "connect:" + teamID + ":" + channelID + ":" + userID + ":" + workspace
 	return fmt.Sprintf(
 		"https://bitbucket.org/site/oauth2/authorize?client_id=%s&response_type=code&state=%s",
 		h.clientID, url.QueryEscape(state),
@@ -80,11 +80,11 @@ func (h *OAuthHandler) HandleCallback(c *fiber.Ctx) error {
 }
 
 func (h *OAuthHandler) handleConnect(c *fiber.Ctx, code, stateBody string) error {
-	parts := strings.SplitN(stateBody, ":", 3)
-	if len(parts) != 3 {
+	parts := strings.SplitN(stateBody, ":", 4)
+	if len(parts) != 4 {
 		return c.Status(fiber.StatusBadRequest).SendString("invalid state")
 	}
-	teamID, channelID, workspace := parts[0], parts[1], parts[2]
+	teamID, channelID, userID, workspace := parts[0], parts[1], parts[2], parts[3]
 
 	token, err := h.exchangeCode(code)
 	if err != nil {
@@ -99,8 +99,8 @@ func (h *OAuthHandler) handleConnect(c *fiber.Ctx, code, stateBody string) error
 	}
 
 	h.log.Info("bitbucket workspace connected", "team", teamID, "workspace", workspace)
-	_, _, _ = h.slack.PostMessage(channelID, slacklib.MsgOptionText(
-		fmt.Sprintf(":white_check_mark: Bitbucket workspace `%s` connected! You can now use `/bb-prs`, `/bb-repos`, and `/repo add`.", workspace),
+	_, _ = h.slack.PostEphemeral(channelID, userID, slacklib.MsgOptionText(
+		fmt.Sprintf(":white_check_mark: Bitbucket workspace `%s` connected!", workspace),
 		false,
 	))
 	return c.SendString("Bitbucket connected! You can close this tab and return to Slack.")
