@@ -89,7 +89,9 @@ SLACK_BOT_TOKEN=xoxb-...
 SLACK_SIGNING_SECRET=...
 BITBUCKET_CLIENT_ID=...
 BITBUCKET_CLIENT_SECRET=...
-DATABASE_URL=postgres://gitslackbot:password@localhost:5432/gitslackbot
+POSTGRES_USER=gitslackbot
+POSTGRES_PASSWORD=change-me
+POSTGRES_DB=gitslackbot
 PUBLIC_URL=https://your-ngrok-url.ngrok-free.app
 ```
 
@@ -124,22 +126,29 @@ go build -o ./build/bot ./cmd/bot
 | `--public-url` | yes | — | Externally reachable base URL |
 | `--addr` | no | `:3000` | Server listen address |
 
-### 6. Docker
+### 6. Docker Compose (recommended)
+
+The fastest way to run the bot — no Go or PostgreSQL install needed.
 
 ```bash
-# Build and run locally
-make docker-start
+# Download the compose file and example env
+curl -O https://raw.githubusercontent.com/h1laryz/bitbucket-slack-bot/master/docker-compose.yml
+curl -O https://raw.githubusercontent.com/h1laryz/bitbucket-slack-bot/master/.env.example
+cp .env.example .env
+```
 
-# Or pull from GitHub Container Registry
-docker pull ghcr.io/h1lary/bitbucket-slack-bot:latest
-docker run --rm \
-  ghcr.io/h1lary/bitbucket-slack-bot:latest \
-  --slack-bot-token=xoxb-... \
-  --slack-signing-secret=... \
-  --bitbucket-client-id=... \
-  --bitbucket-client-secret=... \
-  --db-url=postgres://... \
-  --public-url=https://...
+Edit `.env` with your values, then:
+
+```bash
+docker compose up -d
+```
+
+This pulls the pre-built image from `ghcr.io` and starts PostgreSQL alongside the bot. Data is persisted in `.postgresql/` next to the compose file.
+
+To build from source instead of pulling the image, uncomment `# build: .` in `docker-compose.yml` and run:
+
+```bash
+docker compose build && docker compose up -d
 ```
 
 ## Connecting a workspace
@@ -177,5 +186,5 @@ internal/
   store/              PostgreSQL store — subscriptions, tokens, PR messages, build statuses
   bitbucket/          Webhook handler, OAuth2 callback
   slack/              Slash commands, events, interactions, signature verification
-.github/workflows/    Docker build + push to ghcr.io on every push to main
+.github/workflows/    Docker build + push to ghcr.io on every push to master
 ```
